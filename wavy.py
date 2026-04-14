@@ -1,12 +1,11 @@
 import json
-import jsonpickle
 from typing import Any
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
 
 # ---------------------------------------------------------------------------
-# Logger 
+# Logger
 # ---------------------------------------------------------------------------
 class Logger:
     def __init__(self) -> None:
@@ -104,7 +103,7 @@ logger = Logger()
 # - Lag-1 autocorr of mid changes: -0.50 (strong mean reversion, same as EMERALDS)
 # - Trades spread across 9979-10026 (not just wall prices like EMERALDS)
 ACO_SYM   = "ASH_COATED_OSMIUM"
-ACO_LIMIT = 80    
+ACO_LIMIT = 80
 ACO_FAIR  = 10_000
 
 # INTARIAN_PEPPER_ROOT
@@ -115,8 +114,13 @@ ACO_FAIR  = 10_000
 # - Spread: 13-14 ticks (half-integers, e.g. 11998.5)
 # - ~332 trades/day, avg qty 5.2, avg gap 3034 ticks between trades
 PEPPER_SYM   = "INTARIAN_PEPPER_ROOT"
-PEPPER_LIMIT = 80    
+PEPPER_LIMIT = 80
 PEPPER_SLOPE = 0.001002  # seashells per timestamp unit (verified across all 3 days)
+
+POS_LIMITS = {
+    ACO_SYM:    ACO_LIMIT,
+    PEPPER_SYM: PEPPER_LIMIT,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -143,29 +147,188 @@ def get_best_bid(order_depth: OrderDepth) -> int | None:
 def get_best_ask(order_depth: OrderDepth) -> int | None:
     return min(order_depth.sell_orders) if order_depth.sell_orders else None
 
+
 # ---------------------------------------------------------------------------
-# ASH_COATED_OSMIUM strategy stub
+# ProductTrader base class
+# ---------------------------------------------------------------------------
+class ProductTrader:
+
+    def __init__(self, name, state, prints, new_trader_data, product_group=None):
+
+        self.orders = []
+
+        self.name = name
+        self.state = state
+        self.prints = prints
+        self.new_trader_data = new_trader_data
+        self.product_group = name if product_group is None else product_group
+
+        self.last_traderData = self.get_last_traderData()
+
+        self.position_limit = POS_LIMITS.get(self.name, 0)
+        self.initial_position = self.state.position.get(self.name, 0)
+        self.expected_position = self.initial_position
+
+        self.mkt_buy_orders, self.mkt_sell_orders = self.get_order_depth()
+        self.bid_wall, self.wall_mid, self.ask_wall = self.get_walls()
+        self.best_bid, self.best_ask = self.get_best_bid_ask()
+
+        self.max_allowed_buy_volume, self.max_allowed_sell_volume = self.get_max_allowed_volume()
+        self.total_mkt_buy_volume, self.total_mkt_sell_volume = self.get_total_market_buy_sell_volume()
+
+    def get_last_traderData(self):
+        last_traderData = {}
+        try:
+            if self.state.traderData != '':
+                last_traderData = json.loads(self.state.traderData)
+        except:
+            pass
+        return last_traderData
+
+    def get_best_bid_ask(self):
+        best_bid = best_ask = None
+        try:
+            if len(self.mkt_buy_orders) > 0:
+                best_bid = max(self.mkt_buy_orders.keys())
+            if len(self.mkt_sell_orders) > 0:
+                best_ask = min(self.mkt_sell_orders.keys())
+        except:
+            pass
+        return best_bid, best_ask
+
+    def get_walls(self):
+        bid_wall = wall_mid = ask_wall = None
+        try: bid_wall = min([x for x, _ in self.mkt_buy_orders.items()])
+        except: pass
+        try: ask_wall = max([x for x, _ in self.mkt_sell_orders.items()])
+        except: pass
+        try: wall_mid = (bid_wall + ask_wall) / 2
+        except: pass
+        return bid_wall, wall_mid, ask_wall
+
+    def get_total_market_buy_sell_volume(self):
+        market_bid_volume = market_ask_volume = 0
+        try:
+            market_bid_volume = sum([v for p, v in self.mkt_buy_orders.items()])
+            market_ask_volume = sum([v for p, v in self.mkt_sell_orders.items()])
+        except:
+            pass
+        return market_bid_volume, market_ask_volume
+
+    def get_max_allowed_volume(self):
+        max_allowed_buy_volume = self.position_limit - self.initial_position
+        max_allowed_sell_volume = self.position_limit + self.initial_position
+        return max_allowed_buy_volume, max_allowed_sell_volume
+
+    def get_order_depth(self):
+        order_depth, buy_orders, sell_orders = {}, {}, {}
+        try: order_depth: OrderDepth = self.state.order_depths[self.name]
+        except: pass
+        try: buy_orders = {bp: abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)}
+        except: pass
+        try: sell_orders = {sp: abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
+        except: pass
+        return buy_orders, sell_orders
+
+    def bid(self, price, volume, logging=True):
+        abs_volume = min(abs(int(volume)), self.max_allowed_buy_volume)
+        order = Order(self.name, int(price), abs_volume)
+        if logging: self.log("BUYO", {"p": price, "s": self.name, "v": int(volume)}, product_group='ORDERS')
+        self.max_allowed_buy_volume -= abs_volume
+        self.orders.append(order)
+
+    def ask(self, price, volume, logging=True):
+        abs_volume = min(abs(int(volume)), self.max_allowed_sell_volume)
+        order = Order(self.name, int(price), -abs_volume)
+        if logging: self.log("SELLO", {"p": price, "s": self.name, "v": int(volume)}, product_group='ORDERS')
+        self.max_allowed_sell_volume -= abs_volume
+        self.orders.append(order)
+
+    def log(self, kind, message, product_group=None):
+        if product_group is None: product_group = self.product_group
+        if product_group == 'ORDERS':
+            group = self.prints.get(product_group, [])
+            group.append({kind: message})
+        else:
+            group = self.prints.get(product_group, {})
+            group[kind] = message
+        self.prints[product_group] = group
+
+    def get_orders(self):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# ASH_COATED_OSMIUM — StaticTrader
 #
-# Key insight: behaves like a noisier EMERALDS.
-# Fair value is anchored at 10,000. Mean-reverts aggressively (-0.50 autocorr).
-# The book floats: typical spread=16, best_bid≈9993-9994, best_ask≈10009-10010.
-# Unlike EMERALDS, market trades happen at many price points (9979-10026),
-# not just at fixed wall prices — so posting inside the spread should earn fills.
+# Strategy: pure market-making around wall_mid (outermost bid/ask midpoint).
+# wall_mid ≈ (9991 + 10013) / 2 ≈ 10002, hugging ACO_FAIR = 10000.
+#
+# Phase 1 — TAKING: immediately cross any ask priced ≤ wall_mid - 1 (cheap
+#   relative to range centre) or any bid priced ≥ wall_mid + 1 (expensive).
+#   Also unwind inventory at the mid price when we are off-centre.
+#
+# Phase 2 — MAKING: post the remaining capacity as passive quotes, trying to
+#   overbid the best bid below the mid and underask the best ask above the mid.
+#   This earns the spread while staying inside the existing book.
 # ---------------------------------------------------------------------------
+class AcoTrader(ProductTrader):
+    def __init__(self, state, prints, new_trader_data):
+        super().__init__(ACO_SYM, state, prints, new_trader_data)
 
-def aco_orders(order_depth: OrderDepth, position: int) -> list[Order]:
-    orders: list[Order] = []
+    def get_orders(self):
 
-    buy_cap  = ACO_LIMIT - position   # remaining capacity to buy
-    sell_cap = ACO_LIMIT + position   # remaining capacity to sell
+        if self.wall_mid is None:
+            return {self.name: self.orders}
 
-    # TODO: implement strategy
-    # Suggested approach:
-    #   1. Aggressive: take any ask <= ACO_FAIR - N or bid >= ACO_FAIR + N
-    #   2. Passive: post quotes inside the typical 16-tick spread (e.g. 9993/10009)
-    #   3. Apply inventory skew if needed (similar to TOMATOES)
+        ##########################################################
+        ####### 1. TAKING
+        ##########################################################
+        for sp, sv in self.mkt_sell_orders.items():
+            if sp <= self.wall_mid - 1:
+                self.bid(sp, sv, logging=False)
+            elif sp <= self.wall_mid and self.initial_position < 0:
+                volume = min(sv, abs(self.initial_position))
+                self.bid(sp, volume, logging=False)
 
-    return orders
+        for bp, bv in self.mkt_buy_orders.items():
+            if bp >= self.wall_mid + 1:
+                self.ask(bp, bv, logging=False)
+            elif bp >= self.wall_mid and self.initial_position > 0:
+                volume = min(bv, self.initial_position)
+                self.ask(bp, volume, logging=False)
+
+        ###########################################################
+        ####### 2. MAKING
+        ###########################################################
+        bid_price = int(self.bid_wall + 1)  # base case: just inside outermost bid
+        ask_price = int(self.ask_wall - 1)  # base case: just inside outermost ask
+
+        # Overbid the best bid that is still below wall_mid
+        for bp, bv in self.mkt_buy_orders.items():
+            overbidding_price = bp + 1
+            if bv > 1 and overbidding_price < self.wall_mid:
+                bid_price = max(bid_price, overbidding_price)
+                break
+            elif bp < self.wall_mid:
+                bid_price = max(bid_price, bp)
+                break
+
+        # Underask the best ask that is still above wall_mid
+        for sp, sv in self.mkt_sell_orders.items():
+            underbidding_price = sp - 1
+            if sv > 1 and underbidding_price > self.wall_mid:
+                ask_price = min(ask_price, underbidding_price)
+                break
+            elif sp > self.wall_mid:
+                ask_price = min(ask_price, sp)
+                break
+
+        # POST ORDERS
+        self.bid(bid_price, self.max_allowed_buy_volume)
+        self.ask(ask_price, self.max_allowed_sell_volume)
+
+        return {self.name: self.orders}
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +363,6 @@ def pepper_orders(order_depth: OrderDepth, position: int, timestamp: int, state:
     #   2. Passive bid: post at best_bid + 1 to attract sellers quickly
     #   3. Almost never sell — only post asks far above fair_value if needed for inventory
     # Example skeleton:
-    #   best_ask = get_best_ask(order_depth)
     #   for ap in sorted(order_depth.sell_orders):
     #       if ap > fair_value + 15 or buy_cap <= 0:
     #           break
@@ -212,38 +374,50 @@ def pepper_orders(order_depth: OrderDepth, position: int, timestamp: int, state:
 
 
 # ---------------------------------------------------------------------------
-# Main Trader
+# Trader
 # ---------------------------------------------------------------------------
 class Trader:
 
-    def bid(self) -> int:
-        return 15
+    def run(self, state: TradingState):
+        result: dict[str, list[Order]] = {}
+        new_trader_data = {}
+        prints = {
+            "GENERAL": {
+                "TIMESTAMP": state.timestamp,
+                "POSITIONS": state.position,
+            },
+        }
 
-    def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
-        result: dict[Symbol, list[Order]] = {}
-        conversions = 0
+        # Load persistent PEPPER state
+        persistent = State()
+        try:
+            if state.traderData:
+                data = json.loads(state.traderData)
+                persistent.pepper_base = data.get("_pepper_base")
+        except:
+            pass
 
-        # Restore persistent state from last iteration
-        s: State = jsonpickle.decode(state.traderData) if state.traderData else State()
-
-        # Reset pepper base at the very start of each day
-        if state.timestamp == 0:
-            s.pepper_base = None
-
+        # ASH_COATED_OSMIUM — StaticTrader market-making
         if ACO_SYM in state.order_depths:
-            result[ACO_SYM] = aco_orders(
-                state.order_depths[ACO_SYM],
-                state.position.get(ACO_SYM, 0),
-            )
+            try:
+                trader = AcoTrader(state, prints, new_trader_data)
+                result.update(trader.get_orders())
+            except:
+                pass
 
+        # INTARIAN_PEPPER_ROOT — uptrend carry strategy
         if PEPPER_SYM in state.order_depths:
+            pos = state.position.get(PEPPER_SYM, 0)
             result[PEPPER_SYM] = pepper_orders(
-                state.order_depths[PEPPER_SYM],
-                state.position.get(PEPPER_SYM, 0),
-                state.timestamp,
-                s,
+                state.order_depths[PEPPER_SYM], pos, state.timestamp, persistent
             )
 
-        trader_data = jsonpickle.encode(s)
-        logger.flush(state, result, conversions, trader_data)
-        return result, conversions, trader_data
+        # Persist state for next tick
+        new_trader_data["_pepper_base"] = persistent.pepper_base
+        try:
+            final_trader_data = json.dumps(new_trader_data)
+        except:
+            final_trader_data = ''
+
+        logger.flush(state, result, final_trader_data, final_trader_data)
+        return result, 0, final_trader_data
