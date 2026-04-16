@@ -103,7 +103,7 @@ logger = Logger()
 # - Lag-1 autocorr of mid changes: -0.50 (strong mean reversion, same as EMERALDS)
 # - Trades spread across 9979-10026 (not just wall prices like EMERALDS)
 ACO_SYM   = "ASH_COATED_OSMIUM"
-ACO_LIMIT = 80
+ACO_LIMIT = 50
 ACO_FAIR  = 10_000
 
 # INTARIAN_PEPPER_ROOT
@@ -114,7 +114,7 @@ ACO_FAIR  = 10_000
 # - Spread: 13-14 ticks (half-integers, e.g. 11998.5)
 # - ~332 trades/day, avg qty 5.2, avg gap 3034 ticks between trades
 PEPPER_SYM   = "INTARIAN_PEPPER_ROOT"
-PEPPER_LIMIT = 80
+PEPPER_LIMIT = 50
 PEPPER_SLOPE = 0.001002  # seashells per timestamp unit (verified across all 3 days)
 
 POS_LIMITS = {
@@ -198,9 +198,9 @@ class ProductTrader:
 
     def get_walls(self):
         bid_wall = wall_mid = ask_wall = None
-        try: bid_wall = min([x for x, _ in self.mkt_buy_orders.items()])
+        try: bid_wall = sorted(self.mkt_buy_orders.items(), key=lambda x: x[1], reverse=True)[0][0]
         except: pass
-        try: ask_wall = max([x for x, _ in self.mkt_sell_orders.items()])
+        try: ask_wall = sorted(self.mkt_sell_orders.items(), key=lambda x: x[1], reverse=True)[0][0]
         except: pass
         try: wall_mid = (bid_wall + ask_wall) / 2
         except: pass
@@ -259,18 +259,18 @@ class ProductTrader:
 
 
 # ---------------------------------------------------------------------------
-# ASH_COATED_OSMIUM — StaticTrader
+# ASH_COATED_OSMIUM — AcoTrader
 #
-# Strategy: pure market-making around wall_mid (outermost bid/ask midpoint).
-# wall_mid ≈ (9991 + 10013) / 2 ≈ 10002, hugging ACO_FAIR = 10000.
+# Strategy: market-making anchored to ACO_FAIR = 10000.
+# Typical book: bids 9991–9994, asks 10009–10013 (16-tick spread).
+# wall_mid (outermost midpoint) ≈ 10002 — too high to use as anchor; use
+# the fixed ACO_FAIR instead so taking/making logic is centred on 10000.
 #
-# Phase 1 — TAKING: immediately cross any ask priced ≤ wall_mid - 1 (cheap
-#   relative to range centre) or any bid priced ≥ wall_mid + 1 (expensive).
-#   Also unwind inventory at the mid price when we are off-centre.
+# Phase 1 — TAKING: immediately cross any ask < 10000 (underpriced) or any
+#   bid > 10000 (overpriced). Also unwind inventory at fair value when off-centre.
 #
-# Phase 2 — MAKING: post the remaining capacity as passive quotes, trying to
-#   overbid the best bid below the mid and underask the best ask above the mid.
-#   This earns the spread while staying inside the existing book.
+# Phase 2 — MAKING: post the remaining capacity just inside the best existing
+#   bid/ask, trying to earn the spread around fair value.
 # ---------------------------------------------------------------------------
 class AcoTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
@@ -278,21 +278,24 @@ class AcoTrader(ProductTrader):
 
     def get_orders(self):
 
-        if self.wall_mid is None:
+        if not self.mkt_buy_orders and not self.mkt_sell_orders:
             return {self.name: self.orders}
+
+        fair = ACO_FAIR
+        microprice = (self.best_bid * self.total_mkt_sell_volume + self.best_ask * self.total_mkt_buy_volume) / (self.best_bid * self.total_mkt_sell_volume +  self.total_mkt_buy_volume)
 
         ##########################################################
         ####### 1. TAKING
         ##########################################################
         for sp, sv in self.mkt_sell_orders.items():
-            if sp <= self.wall_mid - 1:
+            if sp <= self.wall_mid-1:
                 self.bid(sp, sv, logging=False)
-            elif sp <= self.wall_mid and self.initial_position < 0:
+            elif sp <=self.wall_mid and self.initial_position < 0:
                 volume = min(sv, abs(self.initial_position))
                 self.bid(sp, volume, logging=False)
 
         for bp, bv in self.mkt_buy_orders.items():
-            if bp >= self.wall_mid + 1:
+            if bp >= self.wall_mid+1:
                 self.ask(bp, bv, logging=False)
             elif bp >= self.wall_mid and self.initial_position > 0:
                 volume = min(bv, self.initial_position)
@@ -301,28 +304,27 @@ class AcoTrader(ProductTrader):
         ###########################################################
         ####### 2. MAKING
         ###########################################################
-        bid_price = int(self.bid_wall + 1)  # base case: just inside outermost bid
-        ask_price = int(self.ask_wall - 1)  # base case: just inside outermost ask
+        # Fallback: just inside outermost walls
+        bid_price = int(self.bid_wall + 1) if self.bid_wall is not None else fair - 7
+        ask_price = int(self.ask_wall - 1) if self.ask_wall is not None else fair + 7
 
-        # Overbid the best bid that is still below wall_mid
+        # Overbid the best bid that is still below fair value
         for bp, bv in self.mkt_buy_orders.items():
             overbidding_price = bp + 1
             if bv > 1 and overbidding_price < self.wall_mid:
                 bid_price = max(bid_price, overbidding_price)
-                break
-            elif bp < self.wall_mid:
+            else:
                 bid_price = max(bid_price, bp)
-                break
+            break
 
-        # Underask the best ask that is still above wall_mid
+        # Underask the best ask that is still above fair value
         for sp, sv in self.mkt_sell_orders.items():
             underbidding_price = sp - 1
             if sv > 1 and underbidding_price > self.wall_mid:
                 ask_price = min(ask_price, underbidding_price)
-                break
-            elif sp > self.wall_mid:
+            else:
                 ask_price = min(ask_price, sp)
-                break
+            break
 
         # POST ORDERS
         self.bid(bid_price, self.max_allowed_buy_volume)
@@ -419,5 +421,5 @@ class Trader:
         except:
             final_trader_data = ''
 
-        logger.flush(state, result, final_trader_data, final_trader_data)
+        logger.flush(state, result, 0, final_trader_data)
         return result, 0, final_trader_data
