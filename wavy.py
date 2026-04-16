@@ -277,72 +277,56 @@ class AcoTrader(ProductTrader):
         super().__init__(ACO_SYM, state, prints, new_trader_data)
 
     def get_orders(self):
-        if not self.mkt_buy_orders or not self.mkt_sell_orders:
+
+        if not self.mkt_buy_orders and not self.mkt_sell_orders:
             return {self.name: self.orders}
 
-        ##########################################################
-        ####### 0. SIGNALS (NEW BUT MINIMAL)
-        ##########################################################
-
-        # FIXED microprice
-        microprice = (
-            self.best_bid * self.total_mkt_sell_volume +
-            self.best_ask * self.total_mkt_buy_volume
-        ) / (self.total_mkt_buy_volume + self.total_mkt_sell_volume)
-
-        # Load previous mid for momentum
-        prev_mid = self.last_traderData.get("prev_mid", microprice)
-        current_mid = (self.best_bid + self.best_ask) / 2
-
-        momentum = current_mid - prev_mid
-
-        # Save for next round
-        self.new_trader_data["prev_mid"] = current_mid
-
-        # Inventory skew (push price opposite to position)
-        inventory_skew = -0.1 * self.initial_position
-
-        # FINAL FAIR PRICE (CORE CHANGE)
-        fair_price = microprice + momentum + inventory_skew
-
-        # Adaptive edge
-        edge = 1 + abs(momentum)
+        fair = ACO_FAIR
+        microprice = (self.best_bid * self.total_mkt_sell_volume + self.best_ask * self.total_mkt_buy_volume) / (self.total_mkt_sell_volume +  self.total_mkt_buy_volume)
 
         ##########################################################
-        ####### 1. TAKING (UPGRADED)
+        ####### 1. TAKING
         ##########################################################
-
         for sp, sv in self.mkt_sell_orders.items():
-            if sp < fair_price - edge:
+            if sp <= self.wall_mid-1:
                 self.bid(sp, sv, logging=False)
-
-            elif sp < fair_price and self.initial_position < 0:
+            elif sp <=self.wall_mid and self.initial_position < 0:
                 volume = min(sv, abs(self.initial_position))
                 self.bid(sp, volume, logging=False)
 
         for bp, bv in self.mkt_buy_orders.items():
-            if bp > fair_price + edge:
+            if bp >= self.wall_mid+1:
                 self.ask(bp, bv, logging=False)
-
-            elif bp > fair_price and self.initial_position > 0:
+            elif bp >= self.wall_mid and self.initial_position > 0:
                 volume = min(bv, self.initial_position)
                 self.ask(bp, volume, logging=False)
 
         ###########################################################
-        ####### 2. MAKING (SMART PRICING)
+        ####### 2. MAKING
         ###########################################################
+        # Auction dynamics insight: post AT the wall price levels, not inside them.
+        # The walls are the max-volume levels that anchor the auction clearing price.
+        # Posting inside the walls puts us at a thinner level that may not clear.
+        bid_price = int(self.bid_wall) if self.bid_wall is not None else fair - 8
+        ask_price = int(self.ask_wall) if self.ask_wall is not None else fair + 8
 
-        spread = max(1, int(abs(momentum) + 1))
+        # Still try to overbid the best bid if it's between wall and fair
+        for bp, bv in self.mkt_buy_orders.items():
+            overbidding_price = bp + 1
+            if bv > 1 and overbidding_price < self.wall_mid:
+                bid_price = max(bid_price, overbidding_price)
+            else:
+                bid_price = max(bid_price, bp)
+            break
 
-        bid_price = int(fair_price - spread)
-        ask_price = int(fair_price + spread)
-
-        # Stay competitive with market
-        if self.best_bid is not None:
-            bid_price = max(bid_price, self.best_bid + 1)
-
-        if self.best_ask is not None:
-            ask_price = min(ask_price, self.best_ask - 1)
+        # Still try to underask the best ask if it's between wall and fair
+        for sp, sv in self.mkt_sell_orders.items():
+            underbidding_price = sp - 1
+            if sv > 1 and underbidding_price > self.wall_mid:
+                ask_price = min(ask_price, underbidding_price)
+            else:
+                ask_price = min(ask_price, sp)
+            break
 
         # POST ORDERS
         self.bid(bid_price, self.max_allowed_buy_volume)
@@ -352,13 +336,20 @@ class AcoTrader(ProductTrader):
 
 
 # ---------------------------------------------------------------------------
-# INTARIAN_PEPPER_ROOT strategy stub
+# INTARIAN_PEPPER_ROOT — uptrend carry trade
 #
 # Key insight: price rises at exactly 0.001002 per timestamp unit (~10/iteration).
 # This is NOT a mean-reversion product — it's a pure uptrend carry trade.
 # Holding max long from the start of each day captures +1,000 units/day.
 # The noise (std≈2) is negligible compared to the trend signal.
 # Fair value at time t = pepper_base + PEPPER_SLOPE * t
+#
+# Auction dynamics insight (Rook-E1): the clearing price is where cumulative
+# bid volume >= cumulative ask volume is maximised. For an uptrending product,
+# buying at current ask prices IS profitable because the trend will cover the
+# cost within a few ticks. Post passive bids at best_bid+1 to attract sellers
+# and take all asks up to fair_value + 20 (trend buffer).
+# Almost never sell — only post asks well above fair_value to avoid filling.
 # ---------------------------------------------------------------------------
 def pepper_orders(order_depth: OrderDepth, position: int, timestamp: int, state: State) -> list[Order]:
     orders: list[Order] = []
@@ -377,18 +368,29 @@ def pepper_orders(order_depth: OrderDepth, position: int, timestamp: int, state:
     # Fair value at the current timestamp
     fair_value = state.pepper_base + PEPPER_SLOPE * timestamp
 
-    # TODO: implement strategy
-    # Suggested approach:
-    #   1. Aggressive buy: take all asks up to fair_value + buffer (trend makes it profitable)
-    #   2. Passive bid: post at best_bid + 1 to attract sellers quickly
-    #   3. Almost never sell — only post asks far above fair_value if needed for inventory
-    # Example skeleton:
-    #   for ap in sorted(order_depth.sell_orders):
-    #       if ap > fair_value + 15 or buy_cap <= 0:
-    #           break
-    #       qty = min(abs(order_depth.sell_orders[ap]), buy_cap)
-    #       orders.append(Order(PEPPER_SYM, ap, qty))
-    #       buy_cap -= qty
+    # Phase 1: Aggressively take asks up to fair_value + 20
+    # The uptrend means even paying slightly above fair value is profitable.
+    for ap in sorted(order_depth.sell_orders.keys()):
+        if ap > fair_value + 20 or buy_cap <= 0:
+            break
+        qty = min(abs(order_depth.sell_orders[ap]), buy_cap)
+        orders.append(Order(PEPPER_SYM, ap, qty))
+        buy_cap -= qty
+
+    # Phase 2: Passive bid just above best existing bid to attract sellers
+    # This positions us at the max-volume clearing level (auction dynamics).
+    if buy_cap > 0 and order_depth.buy_orders:
+        best_bid = max(order_depth.buy_orders.keys())
+        passive_bid = int(best_bid) + 1
+        # Only post if still below fair value (don't pay more than trend justifies)
+        if passive_bid < fair_value + 5:
+            orders.append(Order(PEPPER_SYM, passive_bid, buy_cap))
+
+    # Phase 3: Post asks well above fair value — nearly impossible to fill,
+    # just satisfies position limit rules if we somehow hit max long.
+    if sell_cap > 0:
+        ask_price = int(fair_value + 50)
+        orders.append(Order(PEPPER_SYM, ask_price, -sell_cap))
 
     return orders
 
