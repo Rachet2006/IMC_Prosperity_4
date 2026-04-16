@@ -277,54 +277,72 @@ class AcoTrader(ProductTrader):
         super().__init__(ACO_SYM, state, prints, new_trader_data)
 
     def get_orders(self):
-
-        if not self.mkt_buy_orders and not self.mkt_sell_orders:
+        if not self.mkt_buy_orders or not self.mkt_sell_orders:
             return {self.name: self.orders}
 
-        fair = ACO_FAIR
-        microprice = (self.best_bid * self.total_mkt_sell_volume + self.best_ask * self.total_mkt_buy_volume) / (self.best_bid * self.total_mkt_sell_volume +  self.total_mkt_buy_volume)
+        ##########################################################
+        ####### 0. SIGNALS (NEW BUT MINIMAL)
+        ##########################################################
+
+        # FIXED microprice
+        microprice = (
+            self.best_bid * self.total_mkt_sell_volume +
+            self.best_ask * self.total_mkt_buy_volume
+        ) / (self.total_mkt_buy_volume + self.total_mkt_sell_volume)
+
+        # Load previous mid for momentum
+        prev_mid = self.last_traderData.get("prev_mid", microprice)
+        current_mid = (self.best_bid + self.best_ask) / 2
+
+        momentum = current_mid - prev_mid
+
+        # Save for next round
+        self.new_trader_data["prev_mid"] = current_mid
+
+        # Inventory skew (push price opposite to position)
+        inventory_skew = -0.1 * self.initial_position
+
+        # FINAL FAIR PRICE (CORE CHANGE)
+        fair_price = microprice + momentum + inventory_skew
+
+        # Adaptive edge
+        edge = 1 + abs(momentum)
 
         ##########################################################
-        ####### 1. TAKING
+        ####### 1. TAKING (UPGRADED)
         ##########################################################
+
         for sp, sv in self.mkt_sell_orders.items():
-            if sp <= self.wall_mid-1:
+            if sp < fair_price - edge:
                 self.bid(sp, sv, logging=False)
-            elif sp <=self.wall_mid and self.initial_position < 0:
+
+            elif sp < fair_price and self.initial_position < 0:
                 volume = min(sv, abs(self.initial_position))
                 self.bid(sp, volume, logging=False)
 
         for bp, bv in self.mkt_buy_orders.items():
-            if bp >= self.wall_mid+1:
+            if bp > fair_price + edge:
                 self.ask(bp, bv, logging=False)
-            elif bp >= self.wall_mid and self.initial_position > 0:
+
+            elif bp > fair_price and self.initial_position > 0:
                 volume = min(bv, self.initial_position)
                 self.ask(bp, volume, logging=False)
 
         ###########################################################
-        ####### 2. MAKING
+        ####### 2. MAKING (SMART PRICING)
         ###########################################################
-        # Fallback: just inside outermost walls
-        bid_price = int(self.bid_wall + 1) if self.bid_wall is not None else fair - 7
-        ask_price = int(self.ask_wall - 1) if self.ask_wall is not None else fair + 7
 
-        # Overbid the best bid that is still below fair value
-        for bp, bv in self.mkt_buy_orders.items():
-            overbidding_price = bp + 1
-            if bv > 1 and overbidding_price < self.wall_mid:
-                bid_price = max(bid_price, overbidding_price)
-            else:
-                bid_price = max(bid_price, bp)
-            break
+        spread = max(1, int(abs(momentum) + 1))
 
-        # Underask the best ask that is still above fair value
-        for sp, sv in self.mkt_sell_orders.items():
-            underbidding_price = sp - 1
-            if sv > 1 and underbidding_price > self.wall_mid:
-                ask_price = min(ask_price, underbidding_price)
-            else:
-                ask_price = min(ask_price, sp)
-            break
+        bid_price = int(fair_price - spread)
+        ask_price = int(fair_price + spread)
+
+        # Stay competitive with market
+        if self.best_bid is not None:
+            bid_price = max(bid_price, self.best_bid + 1)
+
+        if self.best_ask is not None:
+            ask_price = min(ask_price, self.best_ask - 1)
 
         # POST ORDERS
         self.bid(bid_price, self.max_allowed_buy_volume)
